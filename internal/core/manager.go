@@ -111,7 +111,7 @@ func (m *XrayManager) QueryTrafficStats(apiPort int) (TrafficStats, error) {
 	defer cancel()
 
 	resp, err := m.statsClient.QueryStats(ctx, &statscommand.QueryStatsRequest{
-		Pattern: "",
+		Pattern: "traffic>>>",
 		Reset_:  false,
 	})
 	if err != nil {
