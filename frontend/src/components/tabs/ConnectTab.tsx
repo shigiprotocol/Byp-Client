@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
 import { Shield, Power, ChevronRight } from '../../icons';
 import { LiveTrafficStats } from '../common/LiveTrafficStats';
@@ -9,7 +9,7 @@ import type { AppTab } from '../../types';
 interface ConnectTabProps {
   connected: boolean;
   mode: string;
-  sessionSeconds: number;
+  sessionSeconds?: number;
   activeProfile?: Profile;
   profiles: Profile[];
   selectedProfileId: string;
@@ -22,6 +22,44 @@ interface ConnectTabProps {
   onPing?: (id: string, e?: React.MouseEvent) => void;
   pingingMap?: Record<string, boolean>;
 }
+
+/**
+ * Isolated timer component that increments locally every second.
+ * Prevents re-rendering ConnectTab or root App component tree!
+ */
+const SessionTimer: React.FC<{ connected: boolean }> = React.memo(({ connected }) => {
+  const [seconds, setSeconds] = useState(0);
+
+  useEffect(() => {
+    let timer: any;
+    if (connected) {
+      setSeconds(0);
+      timer = setInterval(() => {
+        setSeconds((s) => s + 1);
+      }, 1000);
+    } else {
+      setSeconds(0);
+    }
+    return () => clearInterval(timer);
+  }, [connected]);
+
+  if (!connected) return null;
+
+  return (
+    <>
+      <span className="w-2 h-2 rounded-full bg-white shadow-[0_0_8px_rgba(255,255,255,0.9)]" />
+      <span className="font-semibold text-zinc-200 uppercase tracking-wider text-[11px]">
+        CONNECTED
+      </span>
+      <span className="text-white/30">•</span>
+      <span className="font-mono text-zinc-300 text-[11px] font-medium">
+        {formatTimer(seconds)}
+      </span>
+    </>
+  );
+});
+
+SessionTimer.displayName = 'SessionTimer';
 
 /**
  * Connect and traffic monitoring dashboard tab.
@@ -94,18 +132,7 @@ export const ConnectTab: React.FC<ConnectTabProps> = ({
 
         {/* Status & Session Duration below the button */}
         <div className="mt-4 h-5 flex items-center justify-center space-x-2 text-xs">
-          {connected ? (
-            <>
-              <span className="w-2 h-2 rounded-full bg-white shadow-[0_0_8px_rgba(255,255,255,0.9)]" />
-              <span className="font-semibold text-zinc-200 uppercase tracking-wider text-[11px]">
-                CONNECTED
-              </span>
-              <span className="text-white/30">•</span>
-              <span className="font-mono text-zinc-300 text-[11px] font-medium">
-                {formatTimer(sessionSeconds)}
-              </span>
-            </>
-          ) : null}
+          <SessionTimer connected={connected} />
         </div>
       </div>
 

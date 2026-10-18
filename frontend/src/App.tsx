@@ -64,7 +64,6 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [pingingMap, setPingingMap] = useState<Record<string, boolean>>({});
   const [pingingAll, setPingingAll] = useState<boolean>(false);
-  const [sessionSeconds, setSessionSeconds] = useState<number>(0);
 
   // Modals State
   const [showSubModal, setShowSubModal] = useState<boolean>(false);
@@ -257,7 +256,6 @@ export default function App() {
           setSelectedProfileId(status.activeProfileId);
         } else if (!status.connected) {
           setActiveProfileId('');
-          setSessionSeconds(0);
         }
         if (status.activeMode) {
           setMode(status.activeMode);
@@ -319,18 +317,6 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
-  // Connection session timer
-  useEffect(() => {
-    let timer: any;
-    if (connected) {
-      timer = setInterval(() => {
-        setSessionSeconds((s) => s + 1);
-      }, 1000);
-    } else {
-      setSessionSeconds(0);
-    }
-    return () => clearInterval(timer);
-  }, [connected]);
 
   // Optimistic Zero-Lag Connect Toggle
   const handleToggleConnect = () => {
@@ -1156,7 +1142,6 @@ export default function App() {
                 key="connect"
                 connected={connected}
                 mode={mode}
-                sessionSeconds={sessionSeconds}
                 activeProfile={activeProfile}
                 profiles={profiles}
                 selectedProfileId={selectedProfileId}

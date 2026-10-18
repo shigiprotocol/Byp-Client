@@ -57,6 +57,18 @@ export const SplitTab: React.FC<SplitTabProps> = ({
   const appsScrollRef = useRef<HTMLDivElement>(null);
   const [wirePaths, setWirePaths] = useState<WirePath[]>([]);
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
+  const [isDocVisible, setIsDocVisible] = useState<boolean>(() => typeof document !== 'undefined' ? !document.hidden : true);
+
+  useEffect(() => {
+    const handleVisibility = () => {
+      setIsDocVisible(!document.hidden);
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, []);
+
   const [dragWire, setDragWire] = useState<{
     active: boolean;
     sourceId: string;
@@ -446,15 +458,15 @@ export const SplitTab: React.FC<SplitTabProps> = ({
                     stroke={bgStroke}
                     strokeWidth={isSelected ? 5 : 3.5}
                     strokeLinecap="round"
+                    filter={glowFilter}
                   />
-                  {/* Foreground flowing animated dashed line */}
+                  {/* Foreground flowing animated dashed line (no filter to eliminate GPU repaint loop) */}
                   <path
                     d={pathD}
                     fill="none"
                     stroke={strokeColor}
                     strokeWidth={isSelected ? 2.4 : 1.8}
-                    className="wire-animated"
-                    filter={glowFilter}
+                    className={`wire-animated ${!isDocVisible ? 'wire-paused' : ''}`}
                     strokeLinecap="round"
                   />
                 </g>

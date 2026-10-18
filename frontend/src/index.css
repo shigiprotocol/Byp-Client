@@ -147,6 +147,17 @@ button * {
 .wire-animated {
   stroke-dasharray: 4 6;
   animation: wireDash 1s linear infinite;
+  will-change: stroke-dashoffset;
+}
+
+.wire-paused {
+  animation-play-state: paused !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wire-animated {
+    animation: none;
+  }
 }
 
 /* Dotted Grid Canvas Background */
