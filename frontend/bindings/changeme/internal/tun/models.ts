@@ -7,15 +7,7 @@ import { Create as $Create } from "@wailsio/runtime";
 
 export class ProcessAppInfo {
     "pid": number;
-
-    /**
-     * e.g. "discord.exe"
-     */
     "name": string;
-
-    /**
-     * e.g. "C:\Users\...\discord.exe"
-     */
     "path": string;
 
     /** Creates a new ProcessAppInfo instance. */
