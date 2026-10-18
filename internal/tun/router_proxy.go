@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"math/bits"
 	"net"
+	"net/netip"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -108,39 +110,48 @@ func SetGlobalSplitConfig(mode string, apps []string, lanIP net.IP, ifIndex int)
 	}
 }
 
+var selfPID = uint32(os.Getpid())
+
 func (r *SplitRouterProxy) shouldProxy(metadata *M.Metadata) bool {
-	r.mu.RLock()
-	mode := r.mode
-	norm := r.normalizedApps
-	r.mu.RUnlock()
-
-	// Mode: Global TUN -> Proxy all traffic
-	if mode == "" || mode == "all" || mode == "global" {
-		return true
-	}
-
-	// DNS Rule (Port 53):
-	// In Whitelist mode, proxy DNS queries through Xray to protect whitelisted apps from ISP DNS poisoning.
-	if metadata.DstPort == 53 && mode == "whitelist" {
-		return true
-	}
-
-	// Resolve the application owning the local socket from original source port
 	network := "tcp"
 	if metadata.Network == M.UDP {
 		network = "udp"
 	}
 
-	exeName, exePath, _ := ResolveProcessByPort(network, metadata.SrcPort)
+	exeName, exePath, pid := ResolveProcessByPort(network, metadata.SrcPort)
+
+	// 1. Absolute Anti-Routing Loop Guarantee:
+	// Self process or core engine traffic must NEVER enter SOCKS5!
+	if pid == selfPID {
+		return false
+	}
+	lowerExe := strings.ToLower(exeName)
+	if lowerExe == "xray.exe" || lowerExe == "v2ray.exe" || lowerExe == "sing-box.exe" || lowerExe == "byp.exe" {
+		return false
+	}
+
+	r.mu.RLock()
+	mode := r.mode
+	norm := r.normalizedApps
+	r.mu.RUnlock()
+
+	// Mode: Global TUN -> Proxy all other traffic
+	if mode == "" || mode == "all" || mode == "global" {
+		return true
+	}
+
+	// 2. DNS Rule (Port 53): In Whitelist mode, proxy non-core DNS queries to protect from ISP poisoning
+	if metadata.DstPort == 53 && mode == "whitelist" {
+		return true
+	}
+
 	matched := matchAppFast(exeName, exePath, norm)
 
 	if mode == "whitelist" {
-		// Whitelist: ONLY matched apps are routed through VPN
 		return matched
 	}
 
 	if mode == "blacklist" {
-		// Blacklist: Matched apps bypass VPN, everything else goes through VPN
 		return !matched
 	}
 
@@ -263,6 +274,16 @@ type directPacketConn struct {
 func (pc *directPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if udpAddr, ok := addr.(*net.UDPAddr); ok {
 		return pc.PacketConn.WriteTo(b, udpAddr)
+	}
+
+	// Check if addr implements AddrPort directly (e.g. net.UDPAddr or metadata wrapper)
+	if apHolder, ok := addr.(interface{ AddrPort() netip.AddrPort }); ok {
+		return pc.PacketConn.WriteTo(b, net.UDPAddrFromAddrPort(apHolder.AddrPort()))
+	}
+
+	// Zero-lookup parsing using netip instead of net.ResolveUDPAddr per packet
+	if ap, err := netip.ParseAddrPort(addr.String()); err == nil {
+		return pc.PacketConn.WriteTo(b, net.UDPAddrFromAddrPort(ap))
 	}
 
 	udpAddr, err := net.ResolveUDPAddr("udp", addr.String())
