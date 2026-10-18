@@ -151,6 +151,11 @@ func findInterfaceIndexByIP(ipStr string) int {
 	return 0
 }
 
+// GetPhysicalAdapterInfo retrieves the physical default gateway, LAN IP, and interface index
+func (t *TunManager) GetPhysicalAdapterInfo() (PhysicalAdapterInfo, error) {
+	return t.getPhysicalAdapterInfo()
+}
+
 // getPhysicalAdapterInfo retrieves the physical default gateway, LAN IP, and interface index
 func (t *TunManager) getPhysicalAdapterInfo() (PhysicalAdapterInfo, error) {
 	out, err := silentCommand("route", "print", "0.0.0.0").Output()
@@ -268,9 +273,15 @@ func (t *TunManager) Start(serverHost string, socksPort int, splitMode string, s
 	// Configure our custom Per-App split router with physical adapter binding
 	SetGlobalSplitConfig(splitMode, splitApps, adapterInfo.LanIP, adapterInfo.InterfaceIndex)
 
-	// Add static bypass route for each server IP through physical gateway (metric 1)
+	// Add static bypass route for each resolved server IP through physical gateway (metric 1)
 	// This is the absolute guarantee against routing loops!
+	seenIP := make(map[string]bool)
 	for _, sIP := range serverIPs {
+		if sIP == "" || seenIP[sIP] {
+			continue
+		}
+		seenIP[sIP] = true
+		_ = silentCommand("route", "delete", sIP).Run()
 		_ = silentCommand("route", "add", sIP, "mask", "255.255.255.255", adapterInfo.Gateway, "metric", "1").Run()
 		t.addedRoutes = append(t.addedRoutes, sIP)
 	}

@@ -10,6 +10,7 @@ type ConfigMergerOptions struct {
 	HttpPort   int
 	ApiPort    int
 	DnsServers []string
+	BindIP     string
 }
 
 // MergeCompleteConfig takes the outbound JSON (either raw single outbound or {"outbounds":[...]})
@@ -134,6 +135,15 @@ func MergeCompleteConfig(outboundRaw string, opts ConfigMergerOptions) (string, 
 			},
 		},
 	}
+
+	// Bind outbounds to physical adapter LAN IP if provided to prevent TUN routing loops
+	if opts.BindIP != "" {
+		for _, ob := range parsedOutbounds {
+			ob["sendThrough"] = opts.BindIP
+		}
+		directOutbound["sendThrough"] = opts.BindIP
+	}
+
 	allOutbounds := append(parsedOutbounds, directOutbound, blockOutbound)
 
 	inbounds := []map[string]any{

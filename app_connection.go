@@ -37,11 +37,20 @@ func (a *AppService) Connect(profileID string, mode string) error {
 		dnsServers = append(dnsServers, settings.SecondaryDNS)
 	}
 
+	var bindIP string
+	if mode == "tun" {
+		if adapterInfo, err := a.tunMgr.GetPhysicalAdapterInfo(); err == nil && adapterInfo.LanIP != nil && !adapterInfo.LanIP.IsUnspecified() {
+			bindIP = adapterInfo.LanIP.String()
+			a.log("Binding Xray outbounds to physical adapter IP: %s", bindIP)
+		}
+	}
+
 	fullConfig, err := core.MergeCompleteConfig(profile.OutboundJSON, core.ConfigMergerOptions{
 		SocksPort:  settings.SocksPort,
 		HttpPort:   settings.HttpPort,
 		ApiPort:    10807,
 		DnsServers: dnsServers,
+		BindIP:     bindIP,
 	})
 	if err != nil {
 		a.log("Configuration build error: %v", err)
