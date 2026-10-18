@@ -109,6 +109,13 @@ func (a *AppService) statsLoop() {
 				continue
 			}
 
+			// Don't query gRPC or wake up WebView2 JS thread if window is hidden in tray
+			if a.app != nil {
+				if w, ok := a.app.Window.GetByName("main"); ok && !w.IsVisible() {
+					continue
+				}
+			}
+
 			stats, err := a.xrayMgr.QueryTrafficStats(10807)
 			if err == nil && a.app != nil {
 				a.app.Event.Emit("traffic:update", stats)
