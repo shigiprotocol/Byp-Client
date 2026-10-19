@@ -118,7 +118,10 @@ func (r *SplitRouterProxy) shouldProxy(metadata *M.Metadata) bool {
 		network = "udp"
 	}
 
-	exeName, exePath, pid := ResolveProcessByPort(network, metadata.SrcPort)
+	// Destination of this flow, used to match the exact TCP socket (srcPort + remote IP:port)
+	dst, _ := netip.ParseAddrPort(metadata.DestinationAddress())
+
+	exeName, exePath, pid := ResolveProcessByPort(network, metadata.SrcPort, dst)
 
 	// 1. Absolute Anti-Routing Loop Guarantee:
 	// Self process or core engine traffic must NEVER enter SOCKS5!

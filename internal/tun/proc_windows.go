@@ -3,10 +3,12 @@ package tun
 import (
 	"encoding/binary"
 	"fmt"
+	"net/netip"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -42,22 +44,50 @@ type cachedProcess struct {
 	expiresAt int64
 }
 
-type cachedPortEntry struct {
-	exeName   string
-	exePath   string
-	pid       uint32
-	expiresAt int64
+// ---------------------------------------------------------------------------
+// Socket owner lookup
+//
+// FIX (random disconnects in split-tunnel mode):
+// The old implementation merged every table refresh into a global port->pid map
+// that was NEVER cleared, cached port->process for 10s, throttled refreshes to
+// one per 15ms and negative-cached misses for 1.5s. Ephemeral ports are reused
+// constantly, and apps like Steam open dozens of sockets in the same burst, so
+// connections were regularly attributed to the wrong process (or to none) and
+// were sent DIRECT instead of through the VPN (or vice versa) -> "drops".
+//
+// New approach:
+//   - Each refresh builds a brand new snapshot (stale entries disappear).
+//   - TCP is matched on local port + remote IP + remote port, so an old
+//     snapshot can never give a wrong answer for a new connection.
+//   - UDP (no remote address in the table) only trusts a snapshot taken AFTER
+//     the lookup started.
+//   - Concurrent lookups share a single refresh instead of being throttled
+//     into failure, and misses are retried instead of negative-cached.
+// ---------------------------------------------------------------------------
+
+type tcpOwner struct {
+	remote netip.AddrPort
+	pid    uint32
+}
+
+type tcpSnapshot struct {
+	takenAt int64
+	byPort  map[uint16][]tcpOwner
+}
+
+type udpSnapshot struct {
+	takenAt int64
+	byPort  map[uint16]uint32
 }
 
 var (
-	procCache sync.Map // map[uint32]cachedProcess
+	tcpSnap atomic.Pointer[tcpSnapshot]
+	udpSnap atomic.Pointer[udpSnapshot]
 
-	portCacheMu       sync.RWMutex
-	portCache         = make(map[uint32]cachedPortEntry, 2048)
-	pidPortTable      = make(map[uint32]uint32, 2048) // key: (isUDP << 16) | srcPort -> val: pid
-	lastTCPTableFetch int64
-	lastUDPTableFetch int64
-	tableRefreshMu    sync.Mutex
+	tcpRefreshMu sync.Mutex
+	udpRefreshMu sync.Mutex
+
+	procCache sync.Map // map[uint32]cachedProcess
 
 	tableBufPool = sync.Pool{
 		New: func() any {
@@ -90,11 +120,11 @@ func getProcessImage(pid uint32) (string, string) {
 
 	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
-		// Negative cache protected/inaccessible processes for 30s to avoid repeated OpenProcess syscalls
+		// Negative cache protected/inaccessible processes briefly (was 30s) to avoid repeated OpenProcess syscalls
 		procCache.Store(pid, cachedProcess{
 			path:      "",
 			name:      "",
-			expiresAt: nowNano + int64(30*time.Second),
+			expiresAt: nowNano + int64(5*time.Second),
 		})
 		return "", ""
 	}
@@ -115,7 +145,7 @@ func getProcessImage(pid uint32) (string, string) {
 		procCache.Store(pid, cachedProcess{
 			path:      "",
 			name:      "",
-			expiresAt: nowNano + int64(30*time.Second),
+			expiresAt: nowNano + int64(5*time.Second),
 		})
 		return "", ""
 	}
@@ -126,54 +156,52 @@ func getProcessImage(pid uint32) (string, string) {
 	procCache.Store(pid, cachedProcess{
 		path:      fullPath,
 		name:      baseName,
-		expiresAt: nowNano + int64(60*time.Second),
+		expiresAt: nowNano + int64(15*time.Second),
 	})
 
 	return fullPath, baseName
 }
 
-// querySocketTable fetches the Windows TCP or UDP table in a SINGLE syscall whenever possible,
-// with bOrder = 0 (no kernel sorting overhead).
+// querySocketTable fetches the Windows TCP or UDP table, with bOrder = 0 (no kernel sorting overhead).
+// The table can grow between the size probe and the real call, so it retries a few times.
 func querySocketTable(proc *windows.LazyProc, family uintptr, tableClass uintptr) (*[]byte, uint32) {
 	bufPtr := tableBufPool.Get().(*[]byte)
-	size := uint32(cap(*bufPtr))
-	buf := (*bufPtr)[:size]
 
-	// 1st attempt: Pass pre-allocated buffer directly with bOrder = 0 (unsorted)
-	r1, _, _ := proc.Call(
-		uintptr(unsafe.Pointer(&buf[0])),
-		uintptr(unsafe.Pointer(&size)),
-		0, // bOrder = false (CRITICAL: prevents O(N log N) kernel table sorting!)
-		family,
-		tableClass,
-		0,
-	)
+	for attempt := 0; attempt < 4; attempt++ {
+		size := uint32(cap(*bufPtr))
+		buf := (*bufPtr)[:size]
 
-	if r1 == uintptr(windows.ERROR_INSUFFICIENT_BUFFER) && size > 0 {
-		*bufPtr = make([]byte, size+16384)
-		size = uint32(cap(*bufPtr))
-		buf = (*bufPtr)[:size]
-		r1, _, _ = proc.Call(
+		r1, _, _ := proc.Call(
 			uintptr(unsafe.Pointer(&buf[0])),
 			uintptr(unsafe.Pointer(&size)),
-			0,
+			0, // bOrder = false
 			family,
 			tableClass,
 			0,
 		)
+
+		if r1 == 0 && size >= 4 {
+			return bufPtr, size
+		}
+		if r1 == uintptr(windows.ERROR_INSUFFICIENT_BUFFER) && size > 0 {
+			*bufPtr = make([]byte, size+32768)
+			continue
+		}
+		break
 	}
 
-	if r1 != 0 || size < 4 {
-		tableBufPool.Put(bufPtr)
-		return nil, 0
-	}
-
-	return bufPtr, size
+	tableBufPool.Put(bufPtr)
+	return nil, 0
 }
 
-// refreshTCPTableSnapshot loads all active IPv4 and IPv6 TCP ports into pidPortTable at once.
-func refreshTCPTableSnapshot() {
+func buildTCPSnapshot() *tcpSnapshot {
+	snap := &tcpSnapshot{
+		takenAt: time.Now().UnixNano(), // recorded BEFORE querying the kernel
+		byPort:  make(map[uint16][]tcpOwner, 1024),
+	}
+
 	// 1. IPv4 TCP Table (sizeof(MIB_TCPROW_OWNER_PID) = 24)
+	// state(0:4) localAddr(4:8) localPort(8:12) remoteAddr(12:16) remotePort(16:20) pid(20:24)
 	if bufPtr, size := querySocketTable(procGetExtendedTcpTable, afInet, tcpTableOwnerPidAll); bufPtr != nil {
 		buf := (*bufPtr)[:size]
 		numEntries := binary.LittleEndian.Uint32(buf[0:4])
@@ -181,17 +209,23 @@ func refreshTCPTableSnapshot() {
 		const rowSize = 24
 		for i := uint32(0); i < numEntries && offset+rowSize <= len(buf); i++ {
 			row := buf[offset : offset+rowSize]
+			offset += rowSize
 			localPort := binary.BigEndian.Uint16(row[8:10])
 			pid := binary.LittleEndian.Uint32(row[20:24])
-			if localPort > 0 && pid > 0 {
-				pidPortTable[uint32(localPort)] = pid
+			if localPort == 0 || pid == 0 {
+				continue
 			}
-			offset += rowSize
+			var ra [4]byte
+			copy(ra[:], row[12:16])
+			remote := netip.AddrPortFrom(netip.AddrFrom4(ra), binary.BigEndian.Uint16(row[16:18]))
+			snap.byPort[localPort] = append(snap.byPort[localPort], tcpOwner{remote: remote, pid: pid})
 		}
 		tableBufPool.Put(bufPtr)
 	}
 
-	// 2. IPv6 Dual-Stack TCP Table (sizeof(MIB_TCP6ROW_OWNER_PID) = 56)
+	// 2. IPv6 / dual-stack TCP Table (sizeof(MIB_TCP6ROW_OWNER_PID) = 56)
+	// localAddr(0:16) localScope(16:20) localPort(20:24) remoteAddr(24:40) remoteScope(40:44)
+	// remotePort(44:48) state(48:52) pid(52:56)
 	if bufPtr, size := querySocketTable(procGetExtendedTcpTable, afInet6, tcpTableOwnerPidAll); bufPtr != nil {
 		buf := (*bufPtr)[:size]
 		numEntries := binary.LittleEndian.Uint32(buf[0:4])
@@ -199,25 +233,30 @@ func refreshTCPTableSnapshot() {
 		const rowSize = 56
 		for i := uint32(0); i < numEntries && offset+rowSize <= len(buf); i++ {
 			row := buf[offset : offset+rowSize]
+			offset += rowSize
 			localPort := binary.BigEndian.Uint16(row[20:22])
 			pid := binary.LittleEndian.Uint32(row[52:56])
-			if localPort > 0 && pid > 0 {
-				key := uint32(localPort)
-				if _, exists := pidPortTable[key]; !exists {
-					pidPortTable[key] = pid
-				}
+			if localPort == 0 || pid == 0 {
+				continue
 			}
-			offset += rowSize
+			var ra [16]byte
+			copy(ra[:], row[24:40])
+			remote := netip.AddrPortFrom(netip.AddrFrom16(ra).Unmap(), binary.BigEndian.Uint16(row[44:46]))
+			snap.byPort[localPort] = append(snap.byPort[localPort], tcpOwner{remote: remote, pid: pid})
 		}
 		tableBufPool.Put(bufPtr)
 	}
+
+	return snap
 }
 
-// refreshUDPTableSnapshot loads all active IPv4 and IPv6 UDP ports into pidPortTable at once.
-func refreshUDPTableSnapshot() {
-	const udpMask = uint32(1) << 16
+func buildUDPSnapshot() *udpSnapshot {
+	snap := &udpSnapshot{
+		takenAt: time.Now().UnixNano(),
+		byPort:  make(map[uint16]uint32, 512),
+	}
 
-	// 1. IPv4 UDP Table (sizeof(MIB_UDPROW_OWNER_PID) = 12)
+	// 1. IPv4 UDP Table (sizeof(MIB_UDPROW_OWNER_PID) = 12): localAddr(0:4) localPort(4:8) pid(8:12)
 	if bufPtr, size := querySocketTable(procGetExtendedUdpTable, afInet, udpTableOwnerPid); bufPtr != nil {
 		buf := (*bufPtr)[:size]
 		numEntries := binary.LittleEndian.Uint32(buf[0:4])
@@ -225,17 +264,18 @@ func refreshUDPTableSnapshot() {
 		const rowSize = 12
 		for i := uint32(0); i < numEntries && offset+rowSize <= len(buf); i++ {
 			row := buf[offset : offset+rowSize]
+			offset += rowSize
 			localPort := binary.BigEndian.Uint16(row[4:6])
 			pid := binary.LittleEndian.Uint32(row[8:12])
 			if localPort > 0 && pid > 0 {
-				pidPortTable[udpMask|uint32(localPort)] = pid
+				snap.byPort[localPort] = pid
 			}
-			offset += rowSize
 		}
 		tableBufPool.Put(bufPtr)
 	}
 
-	// 2. IPv6 Dual-Stack UDP Table (sizeof(MIB_UDP6ROW_OWNER_PID) = 28)
+	// 2. IPv6 / dual-stack UDP Table (sizeof(MIB_UDP6ROW_OWNER_PID) = 28):
+	// localAddr(0:16) scope(16:20) localPort(20:24) pid(24:28)
 	if bufPtr, size := querySocketTable(procGetExtendedUdpTable, afInet6, udpTableOwnerPid); bufPtr != nil {
 		buf := (*bufPtr)[:size]
 		numEntries := binary.LittleEndian.Uint32(buf[0:4])
@@ -243,105 +283,136 @@ func refreshUDPTableSnapshot() {
 		const rowSize = 28
 		for i := uint32(0); i < numEntries && offset+rowSize <= len(buf); i++ {
 			row := buf[offset : offset+rowSize]
+			offset += rowSize
 			localPort := binary.BigEndian.Uint16(row[20:22])
 			pid := binary.LittleEndian.Uint32(row[24:28])
 			if localPort > 0 && pid > 0 {
-				key := udpMask | uint32(localPort)
-				if _, exists := pidPortTable[key]; !exists {
-					pidPortTable[key] = pid
+				if _, exists := snap.byPort[localPort]; !exists {
+					snap.byPort[localPort] = pid
 				}
 			}
-			offset += rowSize
 		}
 		tableBufPool.Put(bufPtr)
 	}
+
+	return snap
 }
 
-func ResolveProcessByPort(network string, srcPort uint16) (exeName string, exePath string, pid uint32) {
+// freshTCPSnapshot returns a snapshot taken at or after `notBefore`.
+// Concurrent callers share one kernel query instead of being throttled.
+func freshTCPSnapshot(notBefore int64) *tcpSnapshot {
+	if s := tcpSnap.Load(); s != nil && s.takenAt >= notBefore {
+		return s
+	}
+	tcpRefreshMu.Lock()
+	defer tcpRefreshMu.Unlock()
+	if s := tcpSnap.Load(); s != nil && s.takenAt >= notBefore {
+		return s
+	}
+	s := buildTCPSnapshot()
+	tcpSnap.Store(s)
+	return s
+}
+
+func freshUDPSnapshot(notBefore int64) *udpSnapshot {
+	if s := udpSnap.Load(); s != nil && s.takenAt >= notBefore {
+		return s
+	}
+	udpRefreshMu.Lock()
+	defer udpRefreshMu.Unlock()
+	if s := udpSnap.Load(); s != nil && s.takenAt >= notBefore {
+		return s
+	}
+	s := buildUDPSnapshot()
+	udpSnap.Store(s)
+	return s
+}
+
+// find returns the owning PID of the TCP socket (srcPort -> dst).
+// With a valid dst the match is exact on the 4-tuple, so it is safe even on an older snapshot.
+// Without dst it falls back to "the only non-listening owner of that port".
+func (s *tcpSnapshot) find(srcPort uint16, dst netip.AddrPort) uint32 {
+	if s == nil {
+		return 0
+	}
+	owners := s.byPort[srcPort]
+	if len(owners) == 0 {
+		return 0
+	}
+	if dst.IsValid() {
+		dAddr := dst.Addr().Unmap()
+		for _, o := range owners {
+			if o.remote.Port() == dst.Port() && o.remote.Addr() == dAddr {
+				return o.pid
+			}
+		}
+	}
+	// Fallback: port-only match (ignore listening sockets which have no remote).
+	var pid uint32
+	for _, o := range owners {
+		if o.remote.Port() == 0 {
+			continue
+		}
+		if pid != 0 && pid != o.pid {
+			return 0 // ambiguous
+		}
+		pid = o.pid
+	}
+	return pid
+}
+
+func lookupTCPOwner(srcPort uint16, dst netip.AddrPort) uint32 {
+	start := time.Now().UnixNano()
+
+	// Fast path: exact 4-tuple match in the current snapshot is always correct.
+	if dst.IsValid() {
+		if pid := tcpSnap.Load().find(srcPort, dst); pid != 0 {
+			return pid
+		}
+	}
+
+	for attempt := 0; attempt < 3; attempt++ {
+		if pid := freshTCPSnapshot(start).find(srcPort, dst); pid != 0 {
+			return pid
+		}
+		// Socket may not be visible yet; give the kernel a moment and look again.
+		time.Sleep(time.Duration(attempt+1) * 4 * time.Millisecond)
+		start = time.Now().UnixNano()
+	}
+	return 0
+}
+
+func lookupUDPOwner(srcPort uint16) uint32 {
+	start := time.Now().UnixNano()
+	for attempt := 0; attempt < 3; attempt++ {
+		if pid := freshUDPSnapshot(start).byPort[srcPort]; pid != 0 {
+			return pid
+		}
+		time.Sleep(time.Duration(attempt+1) * 4 * time.Millisecond)
+		start = time.Now().UnixNano()
+	}
+	return 0
+}
+
+// ResolveProcessByPort finds the process that owns the local socket srcPort.
+// dst (the remote endpoint of the flow) is used to match TCP sockets exactly; pass
+// an invalid netip.AddrPort{} if unknown.
+func ResolveProcessByPort(network string, srcPort uint16, dst netip.AddrPort) (exeName string, exePath string, pid uint32) {
 	if srcPort == 0 {
 		return "", "", 0
 	}
 
-	var isUDPBit uint32
 	if strings.Contains(strings.ToLower(network), "udp") {
-		isUDPBit = 1
+		pid = lookupUDPOwner(srcPort)
+	} else {
+		pid = lookupTCPOwner(srcPort, dst)
 	}
-	cacheKey := (isUDPBit << 16) | uint32(srcPort)
-	nowNano := time.Now().UnixNano()
-
-	// 1. Fast path: Check resolved portCache OR bulk pidPortTable
-	portCacheMu.RLock()
-	entry, found := portCache[cacheKey]
-	if found && nowNano < entry.expiresAt {
-		portCacheMu.RUnlock()
-		return entry.exeName, entry.exePath, entry.pid
-	}
-	cachedPID := pidPortTable[cacheKey]
-	portCacheMu.RUnlock()
-
-	// 2. If port was not in bulk table, refresh the bulk table (serialized with tableRefreshMu)
-	if cachedPID == 0 {
-		tableRefreshMu.Lock()
-		// Double-check after acquiring refresh lock in case another goroutine just refreshed it
-		portCacheMu.RLock()
-		cachedPID = pidPortTable[cacheKey]
-		portCacheMu.RUnlock()
-
-		nowNano = time.Now().UnixNano()
-		// Throttle kernel table refreshes if many unknown ports arrive at the exact same microsecond
-		const minRefreshInterval = int64(15 * time.Millisecond)
-
-		if cachedPID == 0 {
-			if isUDPBit == 1 {
-				if nowNano-lastUDPTableFetch >= minRefreshInterval {
-					portCacheMu.Lock()
-					refreshUDPTableSnapshot()
-					cachedPID = pidPortTable[cacheKey]
-					lastUDPTableFetch = nowNano
-					portCacheMu.Unlock()
-				}
-			} else {
-				if nowNano-lastTCPTableFetch >= minRefreshInterval {
-					portCacheMu.Lock()
-					refreshTCPTableSnapshot()
-					cachedPID = pidPortTable[cacheKey]
-					lastTCPTableFetch = nowNano
-					portCacheMu.Unlock()
-				}
-			}
-		}
-		tableRefreshMu.Unlock()
-	}
-
-	if cachedPID == 0 {
-		// Negative cache missing port briefly (1500ms) to prevent repeated scans on dead/ephemeral sockets
-		portCacheMu.Lock()
-		portCache[cacheKey] = cachedPortEntry{
-			expiresAt: nowNano + int64(1500*time.Millisecond),
-		}
-		portCacheMu.Unlock()
+	if pid == 0 {
 		return "", "", 0
 	}
 
-	exePath, exeName = getProcessImage(cachedPID)
-
-	portCacheMu.Lock()
-	if len(portCache) > 4096 {
-		for k, v := range portCache {
-			if nowNano >= v.expiresAt {
-				delete(portCache, k)
-			}
-		}
-	}
-	portCache[cacheKey] = cachedPortEntry{
-		exeName:   exeName,
-		exePath:   exePath,
-		pid:       cachedPID,
-		expiresAt: nowNano + int64(10*time.Second),
-	}
-	portCacheMu.Unlock()
-
-	return exeName, exePath, cachedPID
+	exePath, exeName = getProcessImage(pid)
+	return exeName, exePath, pid
 }
 
 func GetRunningProcesses() ([]ProcessAppInfo, error) {
