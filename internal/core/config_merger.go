@@ -3,6 +3,7 @@ package core
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 )
 
 type ConfigMergerOptions struct {
@@ -11,6 +12,13 @@ type ConfigMergerOptions struct {
 	ApiPort    int
 	DnsServers []string
 	BindIP     string
+
+	// ServerHost / ServerIPs: when the proxy server is a domain, the caller can pre-resolve it
+	// (before TUN is up) so Xray never needs to resolve its own server through the tunnel.
+	// Without this, in TUN split mode the OS DNS query for the server goes into the TUN ->
+	// SOCKS -> Xray -> which needs the server address -> loop / timeout -> reconnect storms.
+	ServerHost string
+	ServerIPs  []string
 }
 
 // MergeCompleteConfig takes the outbound JSON (either raw single outbound or {"outbounds":[...]})
@@ -52,6 +60,7 @@ func MergeCompleteConfig(outboundRaw string, opts ConfigMergerOptions) (string, 
 	// We safely bridge this by setting a dotless host alias ("proxynode") and resolving it
 	// via internal dns.hosts + sockopt.domainStrategy: "UseIP".
 	dnsConfig := map[string]any{}
+	hosts := map[string]any{}
 	proxyOutbound := parsedOutbounds[0]
 	protocol, _ := proxyOutbound["protocol"].(string)
 
@@ -109,11 +118,31 @@ func MergeCompleteConfig(outboundRaw string, opts ConfigMergerOptions) (string, 
 		}
 		sockopt["domainStrategy"] = "UseIP"
 
-		dnsConfig = map[string]any{
-			"hosts": map[string]any{
-				alias: targetHost,
-			},
+		hosts[alias] = targetHost
+	}
+
+	// Pin the server domain to its pre-resolved IPs (TUN mode)
+	if targetHost != "" && net.ParseIP(targetHost) == nil && targetHost == opts.ServerHost && len(opts.ServerIPs) > 0 {
+		hosts[targetHost] = opts.ServerIPs
+
+		if streamSettings == nil {
+			streamSettings = make(map[string]any)
+			proxyOutbound["streamSettings"] = streamSettings
 		}
+		sockopt, ok := streamSettings["sockopt"].(map[string]any)
+		if !ok {
+			sockopt = make(map[string]any)
+			streamSettings["sockopt"] = sockopt
+		}
+		// Resolve through Xray's internal DNS (which honours dns.hosts) instead of the OS resolver.
+		// TLS SNI is still taken from the domain, only the socket address changes.
+		if _, set := sockopt["domainStrategy"]; !set {
+			sockopt["domainStrategy"] = "UseIPv4"
+		}
+	}
+
+	if len(hosts) > 0 {
+		dnsConfig["hosts"] = hosts
 	}
 
 	if len(opts.DnsServers) > 0 {
@@ -205,7 +234,7 @@ func MergeCompleteConfig(outboundRaw string, opts ConfigMergerOptions) (string, 
 		"levels": map[string]any{
 			"0": map[string]any{
 				"handshake":         4,
-				"connIdle":          30,
+				"connIdle":          300, // was 30: killed every connection idle >30s (Steam/games/chat) -> random drops
 				"uplinkOnly":        2,
 				"downlinkOnly":      5,
 				"bufferSize":        4,
