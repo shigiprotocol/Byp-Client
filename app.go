@@ -28,6 +28,12 @@ type AppService struct {
 	activeProfileID string
 	activeMode      string
 	app             *application.App
+
+	// tunNetSig is the physical gateway|LAN IP that the active TUN session was built on.
+	tunNetSig string
+	// userEpoch changes on every Connect/Disconnect so the network watcher can tell
+	// when the user has taken over during an automatic reconnect.
+	userEpoch uint64
 }
 
 // NewAppService initializes a new AppService with storage and engine managers.
@@ -61,6 +67,7 @@ func (a *AppService) ServiceStartup(ctx context.Context, options application.Ser
 
 	go a.listenForKillSignals()
 	go a.statsLoop()
+	go a.netWatchLoop()
 	return nil
 }
 

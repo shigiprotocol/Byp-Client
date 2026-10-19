@@ -217,11 +217,19 @@ func (a *AppService) UpdateProfile(profile storage.Profile) error {
 				bindIP = adapterInfo.LanIP.String()
 			}
 		}
+		var dnsServers []string
+		if settings.PrimaryDNS != "" {
+			dnsServers = append(dnsServers, settings.PrimaryDNS)
+		}
+		if settings.SecondaryDNS != "" {
+			dnsServers = append(dnsServers, settings.SecondaryDNS)
+		}
 		cfgJSON, err := core.MergeCompleteConfig(profile.OutboundJSON, core.ConfigMergerOptions{
-			SocksPort: settings.SocksPort,
-			HttpPort:  settings.HttpPort,
-			ApiPort:   10807,
-			BindIP:    bindIP,
+			SocksPort:  settings.SocksPort,
+			HttpPort:   settings.HttpPort,
+			ApiPort:    10807,
+			DnsServers: dnsServers,
+			BindIP:     bindIP,
 		})
 		if err == nil {
 			_ = a.xrayMgr.Start(cfgJSON)

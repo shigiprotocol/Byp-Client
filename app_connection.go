@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"time"
 
 	"changeme/internal/core"
@@ -13,6 +14,7 @@ import (
 func (a *AppService) Connect(profileID string, mode string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.userEpoch++
 
 	profile := a.store.GetProfile(profileID)
 	if profile == nil {
@@ -38,10 +40,27 @@ func (a *AppService) Connect(profileID string, mode string) error {
 	}
 
 	var bindIP string
+	var netSig string
+	var serverIPs []string
 	if mode == "tun" {
 		if adapterInfo, err := a.tunMgr.GetPhysicalAdapterInfo(); err == nil && adapterInfo.LanIP != nil && !adapterInfo.LanIP.IsUnspecified() {
 			bindIP = adapterInfo.LanIP.String()
+			netSig = adapterSignature(adapterInfo)
 			a.log("Binding Xray outbounds to physical adapter IP: %s", bindIP)
+		}
+		// Pre-resolve the server domain while TUN is still down (direct DNS), so Xray
+		// never has to resolve its own server through the tunnel.
+		if profile.Server != "" && net.ParseIP(profile.Server) == nil {
+			if ips, err := net.LookupIP(profile.Server); err == nil {
+				for _, ip := range ips {
+					if ip.To4() != nil {
+						serverIPs = append(serverIPs, ip.String())
+					}
+				}
+			}
+			if len(serverIPs) > 0 {
+				a.log("Server %s resolved to %v", profile.Server, serverIPs)
+			}
 		}
 	}
 
@@ -51,6 +70,8 @@ func (a *AppService) Connect(profileID string, mode string) error {
 		ApiPort:    10807,
 		DnsServers: dnsServers,
 		BindIP:     bindIP,
+		ServerHost: profile.Server,
+		ServerIPs:  serverIPs,
 	})
 	if err != nil {
 		a.log("Configuration build error: %v", err)
@@ -85,6 +106,7 @@ func (a *AppService) Connect(profileID string, mode string) error {
 			_ = a.xrayMgr.Stop()
 			return fmt.Errorf("TUN mode failed (run as Administrator): %w", err)
 		}
+		a.tunNetSig = netSig
 		a.log("Windows TUN Mode activated successfully")
 
 	case "core":
@@ -126,6 +148,8 @@ func (a *AppService) Connect(profileID string, mode string) error {
 func (a *AppService) Disconnect() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.userEpoch++
+	a.tunNetSig = ""
 
 	if !a.connected && !a.xrayMgr.IsRunning() && !a.tunMgr.IsRunning() {
 		return nil
@@ -159,6 +183,8 @@ func (a *AppService) ResetNetwork() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	a.userEpoch++
+	a.tunNetSig = ""
 	a.log("Resetting network: clearing system proxy and routing table...")
 
 	_ = sysproxy.ClearProxy()
