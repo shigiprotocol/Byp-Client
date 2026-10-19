@@ -1,0 +1,44 @@
+name: Build Windows
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Task and Wails CLI
+        shell: bash
+        run: |
+          go install github.com/go-task/task/v3/cmd/task@latest
+          WAILS_VER=$(go list -m -f '{{.Version}}' github.com/wailsapp/wails/v3)
+          go install github.com/wailsapp/wails/v3/cmd/wails3@${WAILS_VER}
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Build
+        shell: bash
+        run: task build
+
+      - name: Collect exe
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp bin/*.exe dist/Byp.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Byp-windows-amd64
+          path: dist/Byp.exe
